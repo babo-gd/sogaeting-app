@@ -10,6 +10,7 @@ import { explainTop, shortReason, suggestRelaxations, applyRelaxation, exclusion
 import { emptyViews, recordView, interestedMatches, isInterested, viewSummary } from './views.js';
 import { emptyChats, getRoom, sendMessage, markRead, unreadTotal, sortedRooms, resolveReplies, seedChats, icebreakers, MAX_MESSAGE } from './chat.js';
 import { MAX_PHOTOS, loadPhotos, savePhotos, resizeImage } from './photos.js';
+import { buildMatchFacts, fallbackExplanation } from './llm.js';
 
 const STORAGE_KEY = 'sogaeting.me.v1';
 const pool = generateProfiles();
@@ -577,6 +578,7 @@ function matchCard(m, rank) {
         </ul>
         ${niceList.length ? `<h3>되면 좋음 조건</h3><div class="chips static">${niceList.map((c) => `<span class="tag ${c.ok ? 'good' : 'warn'}">${c.who} · ${c.label} ${c.ok ? '맞음' : '안 맞음'}</span>`).join('')}</div>` : ''}
       </details>
+      ${aiBlock(p.id)}
       <div class="card-actions">${chatAction(p)}${requestAction(p)}</div>
     </article>`;
 }
@@ -1171,6 +1173,122 @@ async function addPhotos(files) {
 
 const findMatch = (id) => matchPair(me, profileById.get(id));
 
+// ---------- AI 매칭 설명 (로컬 LLM) ----------
+// 추천 알고리즘이 계산한 사실을 서버(server.js)로 보내면, 서버가 Ollama에 물어 설명을 한 글자씩 흘려 보냄
+const llm = { checked: false, ok: false, model: '', error: '' };
+const ai = new Map(); // 상대 id → { status: 'loading' | 'done' | 'error', text, source: 'llm' | 'rule', ms, note }
+let aiRun = null; // 지금 만들고 있는 설명 { id, abort }
+
+async function checkLlm() {
+  const local = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+  try {
+    const r = await fetch('api/llm/status', { cache: 'no-store' });
+    Object.assign(llm, await r.json());
+  } catch {
+    Object.assign(llm, {
+      ok: false,
+      error: local ? '서버에 연결할 수 없어요. npm start로 실행해 주세요.' : '배포 사이트에서는 로컬 LLM을 쓸 수 없어요. 내 컴퓨터에서 npm start로 실행하면 쓸 수 있어요.',
+    });
+  }
+  llm.checked = true;
+  document.querySelectorAll('[data-ai-box]').forEach((el) => updateAi(el.dataset.aiBox));
+}
+
+const llmLabel = () =>
+  !llm.checked ? '로컬 LLM 확인 중…' : llm.ok ? `로컬 LLM · ${esc(llm.model)}` : 'LLM 연결 안 됨 · 규칙 기반 설명';
+
+const aiText = (text) =>
+  esc(text)
+    .split('\n')
+    .filter((l) => l.trim())
+    .map((l) => `<p>${l}</p>`)
+    .join('');
+
+function aiBlock(id) {
+  const s = ai.get(id);
+  const head = `<div class="ai-head"><b>🤖 AI 매칭 설명</b><small>${s?.source === 'rule' ? 'LLM 대신 규칙으로 만든 설명' : llmLabel()}</small></div>`;
+  let body;
+  if (!s) {
+    body = `${!llm.ok && llm.checked ? `<p class="hint">${esc(llm.error)}</p>` : '<p class="hint">추천 점수와 가치관 답변을 바탕으로 AI가 이 상대를 추천한 이유를 설명해요.</p>'}
+      <button class="ai-btn" data-ai="${id}">${llm.ok || !llm.checked ? '✨ AI 설명 듣기' : '📝 규칙 기반 설명 보기'}</button>`;
+  } else if (s.status === 'loading') {
+    body = `<div class="ai-text loading" aria-live="polite">${s.text ? aiText(s.text) : '<p class="hint">AI가 설명을 준비하고 있어요… 내 컴퓨터에서 돌아가서 30초 정도 걸릴 수 있어요.</p>'}<span class="caret" aria-hidden="true"></span></div>
+      <button class="ai-btn ghost-sm" data-ai-stop>그만 만들기</button>`;
+  } else {
+    body = `<div class="ai-text">${aiText(s.text)}</div>
+      ${s.note ? `<p class="hint warn">${esc(s.note)}</p>` : ''}
+      <div class="ai-foot"><small>${s.source === 'llm' ? `${esc(llm.model)} · ${Math.round((s.ms ?? 0) / 1000)}초` : ''} · 점수·답변 같은 사실은 추천 알고리즘이 계산했어요</small>
+      <button class="link-btn" data-ai="${id}">다시 만들기</button></div>`;
+  }
+  return `<section class="ai-box ${s?.status ?? ''}" data-ai-box="${id}">${head}${body}</section>`;
+}
+
+// 화면 전체를 다시 그리지 않고 설명 상자만 갱신 (사진 넘기던 위치 등이 유지되도록)
+function updateAi(id) {
+  const box = document.querySelector(`[data-ai-box="${CSS.escape(id)}"]`);
+  if (box) box.outerHTML = aiBlock(id);
+}
+
+async function runAi(id) {
+  if (aiRun && aiRun.id !== id) return showToast('다른 상대의 설명을 만드는 중이에요. 끝나면 다시 눌러 주세요');
+  const list = matches().matches;
+  const rank = list.findIndex((m) => m.profile.id === id);
+  if (rank < 0) return;
+  const facts = buildMatchFacts(me, list[rank], { rank, headline: rank === 0 ? explainTop(me, list)?.headline : '' });
+
+  if (!llm.ok) {
+    ai.set(id, { status: 'done', text: fallbackExplanation(facts), source: 'rule' });
+    return updateAi(id);
+  }
+
+  const abort = new AbortController();
+  aiRun = { id, abort };
+  const state = { status: 'loading', text: '', source: 'llm' };
+  ai.set(id, state);
+  updateAi(id);
+  let pending = null; // 글자가 올 때마다 그리면 무거워서 화면 갱신은 한 박자에 한 번
+  const paint = () => (pending ??= setTimeout(() => ((pending = null), updateAi(id)), 80));
+  try {
+    const r = await fetch('api/explain', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ facts }),
+      signal: abort.signal,
+    });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? `서버 응답 ${r.status}`);
+    const decoder = new TextDecoder();
+    let buf = '';
+    for await (const chunk of r.body) {
+      buf += decoder.decode(chunk, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const msg = JSON.parse(buf.slice(0, i));
+        buf = buf.slice(i + 1);
+        if (msg.error) throw new Error(msg.error);
+        if (msg.t) {
+          state.text += msg.t;
+          paint();
+        }
+        if (msg.done) state.ms = msg.ms;
+      }
+    }
+    if (!state.text.trim()) throw new Error('AI가 빈 답을 보냈어요');
+    state.status = 'done';
+  } catch (e) {
+    if (abort.signal.aborted) {
+      if (state.text.trim()) Object.assign(state, { status: 'done', note: '설명을 중간에 멈췄어요.' });
+      else ai.delete(id);
+    } else {
+      // LLM이 실패하면 같은 형식의 규칙 기반 설명으로 대신함
+      Object.assign(state, { status: 'done', source: 'rule', text: fallbackExplanation(facts), note: `${e.message} 대신 규칙으로 만든 설명을 보여드려요.` });
+    }
+  } finally {
+    clearTimeout(pending);
+    aiRun = null;
+    updateAi(id);
+  }
+}
+
 // 확인 창의 "신청하기/승인하기"
 function confirmSheet() {
   const input = document.querySelector('#sheet-kakao');
@@ -1204,6 +1322,8 @@ document.addEventListener('click', (e) => {
     return render();
   }
   if (hit('[data-sheet-confirm]')) return confirmSheet();
+  if ((el = hit('[data-ai]'))) return runAi(el.dataset.ai);
+  if (hit('[data-ai-stop]')) return aiRun?.abort.abort();
   if ((el = hit('[data-c-move]'))) {
     const slides = el.closest('[data-carousel]').querySelector('.slides');
     slides.scrollBy({ left: Number(el.dataset.cMove) * slides.clientWidth, behavior: 'smooth' });
@@ -1432,3 +1552,4 @@ setInterval(() => {
 
 resolveDue(me.requests);
 render();
+checkLlm();
