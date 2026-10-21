@@ -10,7 +10,8 @@ import { explainTop, shortReason, suggestRelaxations, applyRelaxation, exclusion
 import { emptyViews, recordView, interestedMatches, isInterested, viewSummary } from './views.js';
 import { emptyChats, getRoom, sendMessage, markRead, unreadTotal, sortedRooms, resolveReplies, seedChats, icebreakers, MAX_MESSAGE } from './chat.js';
 import { MAX_PHOTOS, loadPhotos, savePhotos, resizeImage } from './photos.js';
-import { buildMatchFacts, fallbackExplanation } from './llm.js';
+import { aiCandidates, traitsOf, myTraits, splitGroups, fallbackPicks, explainFacts, fallbackMatchExplanation, BATCH_SIZE, PICK_COUNT, LABELS } from './aimatch.js';
+import { callName } from './llm.js';
 
 const STORAGE_KEY = 'sogaeting.me.v1';
 const pool = generateProfiles();
@@ -31,11 +32,13 @@ const ICONS = {
   back: '<path d="m15 5-7 7 7 7"/>',
   close: '<path d="M6 6l12 12M18 6 6 18"/>',
   chevron: '<path d="m9 5 7 7-7 7"/>',
+  ai: '<path d="M12 3.5 13.8 9 19.5 10.5 13.8 12.2 12 18 10.2 12.2 4.5 10.5 10.2 9z"/><path d="M18.5 15.5v4M16.5 17.5h4"/>',
 };
 const icon = (name) => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 
 const TABS = [
   { id: 'home', label: '홈' },
+  { id: 'ai', label: 'AI 매칭' },
   { id: 'results', label: '추천' },
   { id: 'inbox', label: '신청함' },
   { id: 'chat', label: '채팅' },
@@ -43,7 +46,8 @@ const TABS = [
 ];
 const SUBS = { profile: '내 프로필', prefs: '원하는 조건', interests: '관심사', values: '가치관', logic: '나만의 추천 로직' };
 
-const freshState = () => ({ requests: emptyRequests(), views: emptyViews(), chats: emptyChats() });
+// ai: LLM이 고른 결과, aiExplain: 매칭 성사 후 LLM 설명 (상대 id → 설명)
+const freshState = () => ({ requests: emptyRequests(), views: emptyViews(), chats: emptyChats(), ai: null, aiExplain: {} });
 
 let me = load();
 let tab = 'home';
@@ -282,6 +286,7 @@ function renderHome() {
       ${avatarEl(me, 'lg')}
       <div><p>${esc(me.name)}님, 반가워요</p><h2>오늘의 추천이 도착했어요</h2></div>
     </section>
+    <button class="banner ai" data-tab="ai"><span aria-hidden="true">🤖</span><b>LLM이 직접 골라 주는 AI 매칭</b><small>${me.ai ? '결과 보기' : '시작하기'}</small></button>
     ${newRequests ? `<button class="banner" data-inbox="received"><span aria-hidden="true">💌</span><b>새 매칭 신청 ${newRequests}건</b><small>확인하기</small></button>` : ''}
     ${matched ? `<button class="banner good" data-inbox="${me.requests.sent.some((r) => revealInfo(r).visible) ? 'sent' : 'received'}"><span aria-hidden="true">🎉</span><b>성사된 매칭 ${matched}건</b><small>카카오 ID 보기</small></button>` : ''}
     ${unreadTotal(me.chats) ? `<button class="banner" data-tab="chat"><span aria-hidden="true">💬</span><b>안 읽은 메시지 ${unreadTotal(me.chats)}개</b><small>채팅 보기</small></button>` : ''}
@@ -320,6 +325,7 @@ const OB_STEPS = [
   { emoji: '🚭', title: '상대의 흡연 여부는<br>어떤 게 좋으세요?', body: parts.smokingPref },
   { emoji: '✨', title: '상대의 외모 취향을<br>알려주세요', sub: '반드시 · 되면 좋음 · 상관없음으로 정할 수 있어요', body: parts.appearancePrefs },
   { emoji: '🎨', title: '관심사를<br>골라주세요', sub: '비슷한 성향의 사람을 찾는 데 써요', body: parts.interests },
+  { emoji: '✍️', title: '나를 짧게<br>소개해 주세요', sub: 'AI 매칭에서 LLM이 이 글을 읽고 어울리는 사람을 골라요', body: () => selfIntroInput() },
   { emoji: '💭', title: '마지막으로<br>가치관을 알려주세요', sub: `${VALUE_QUESTIONS.length}개 질문 · 약 3분이면 끝나요`, body: () => '<p class="ob-note">이 앱에서 가장 중요한 단계예요. 내 답과 상대에게 바라는 답, 중요도를 골라주세요.</p>' },
 ];
 
@@ -442,6 +448,7 @@ function renderProfile() {
        ${field('지역', regionPicker())}
        ${field('흡연', segmented('smoking', SMOKING))}`,
     )}
+    ${group('자기소개', selfIntroInput(), 'AI 매칭에서 LLM이 이 글을 읽고 나와 어울리는 사람을 골라요')}
     ${group(
       '연락처',
       field(
@@ -514,6 +521,7 @@ function matchCard(m, rank) {
   return `
     <article class="card match" data-view-id="${p.id}">
       ${rank === 0 ? '<p class="best">👑 가장 잘 맞는 상대</p>' : ''}
+      ${aiPickOf(p.id) ? '<p class="best ai">🤖 AI 매칭에서도 고른 상대</p>' : ''}
       ${carousel(p.id, profileSlides(p), isInterested(me.views[p.id]) ? `<span class="c-badge">👀 ${viewSummary(me.views[p.id])}</span>` : '')}
       <header class="match-head no-avatar">
         <div class="match-who">
@@ -578,7 +586,7 @@ function matchCard(m, rank) {
         </ul>
         ${niceList.length ? `<h3>되면 좋음 조건</h3><div class="chips static">${niceList.map((c) => `<span class="tag ${c.ok ? 'good' : 'warn'}">${c.who} · ${c.label} ${c.ok ? '맞음' : '안 맞음'}</span>`).join('')}</div>` : ''}
       </details>
-      ${aiBlock(p.id)}
+      ${isMatched(p.id) ? explainBlock(p.id) : ''}
       <div class="card-actions">${chatAction(p)}${requestAction(p)}</div>
     </article>`;
 }
@@ -646,9 +654,10 @@ function requestCard(req) {
               <div><small>${esc(p.name)}님의 카카오톡 ID</small><b>${demoKakaoId(p)}</b></div>
               <button class="copy-btn" data-copy="${demoKakaoId(p)}">복사</button>
             </div>
-            <p class="req-note">⏰ ${formatRemaining(reveal.remainingMs)} · 내 ID <b>${esc(me.kakaoId ?? '')}</b>도 상대에게 보여요</p>`;
+            <p class="req-note">⏰ ${formatRemaining(reveal.remainingMs)} · 내 ID <b>${esc(me.kakaoId ?? '')}</b>도 상대에게 보여요</p>
+            ${explainBlock(p.id)}`;
   } else if (reveal.expired) {
-    body = '<p class="req-note">연락처 공개 기간(72시간)이 끝났어요</p>';
+    body = `<p class="req-note">연락처 공개 기간(72시간)이 끝났어요</p>${explainBlock(p.id)}`;
   } else {
     body = `<p class="req-note">${req.dir === 'sent' ? '아쉽게도 이번에는 매칭이 성사되지 않았어요' : '내가 거절한 신청이에요'}</p>`;
   }
@@ -1041,9 +1050,9 @@ function zeroGuide() {
     </section>`;
 }
 
-const RENDERERS = { home: renderHome, results: renderResults, inbox: renderInbox, chat: renderChatList, my: renderMy };
+const RENDERERS = { home: renderHome, ai: renderAi, results: renderResults, inbox: renderInbox, chat: renderChatList, my: renderMy };
 const SUB_RENDERERS = { profile: renderProfile, prefs: renderPrefs, interests: renderInterests, values: renderValues, logic: renderLogic };
-const TITLES = { home: '', results: '추천 상대', inbox: '매칭 신청함', chat: '채팅', my: '마이페이지' };
+const TITLES = { home: '', ai: 'AI 매칭', results: '추천 상대', inbox: '매칭 신청함', chat: '채팅', my: '마이페이지' };
 
 function render() {
   // 다시 그려도 넘겨 보던 사진 위치는 유지
@@ -1173,11 +1182,13 @@ async function addPhotos(files) {
 
 const findMatch = (id) => matchPair(me, profileById.get(id));
 
-// ---------- AI 매칭 설명 (로컬 LLM) ----------
-// 추천 알고리즘이 계산한 사실을 서버(server.js)로 보내면, 서버가 Ollama에 물어 설명을 한 글자씩 흘려 보냄
+// ---------- AI 매칭 (로컬 LLM) ----------
+// 1) 서로의 "반드시" 조건을 통과한 이성만 후보로 → 2) 나와 후보들의 특징을 글로 리스트업
+// 3) server.js → Ollama: LLM이 특징을 읽고 가장 잘 맞는 상대를 직접 골라 이유를 씀 (점수 계산 없음)
+// 4) 매칭이 성사되면 LLM이 두 사람이 왜 매칭됐는지 설명
 const llm = { checked: false, ok: false, model: '', error: '' };
-const ai = new Map(); // 상대 id → { status: 'loading' | 'done' | 'error', text, source: 'llm' | 'rule', ms, note }
-let aiRun = null; // 지금 만들고 있는 설명 { id, abort }
+let aiJob = null; // 지금 돌고 있는 LLM 작업 (CPU라 한 번에 하나만) { kind: 'match' | 'explain', id, abort, phase, step, steps, size, startedAt }
+const explaining = new Map(); // 상대 id → 만들고 있는 설명 { text }
 
 async function checkLlm() {
   const local = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
@@ -1191,11 +1202,11 @@ async function checkLlm() {
     });
   }
   llm.checked = true;
-  document.querySelectorAll('[data-ai-box]').forEach((el) => updateAi(el.dataset.aiBox));
+  if (!aiJob && !sheet && !typing()) render();
 }
 
 const llmLabel = () =>
-  !llm.checked ? '로컬 LLM 확인 중…' : llm.ok ? `로컬 LLM · ${esc(llm.model)}` : 'LLM 연결 안 됨 · 규칙 기반 설명';
+  !llm.checked ? '로컬 LLM 확인 중…' : llm.ok ? `로컬 LLM · ${esc(llm.model)}` : 'LLM 연결 안 됨 · 규칙 기반으로 대신해요';
 
 const aiText = (text) =>
   esc(text)
@@ -1204,90 +1215,309 @@ const aiText = (text) =>
     .map((l) => `<p>${l}</p>`)
     .join('');
 
-function aiBlock(id) {
-  const s = ai.get(id);
-  const head = `<div class="ai-head"><b>🤖 AI 매칭 설명</b><small>${s?.source === 'rule' ? 'LLM 대신 규칙으로 만든 설명' : llmLabel()}</small></div>`;
-  let body;
-  if (!s) {
-    body = `${!llm.ok && llm.checked ? `<p class="hint">${esc(llm.error)}</p>` : '<p class="hint">추천 점수와 가치관 답변을 바탕으로 AI가 이 상대를 추천한 이유를 설명해요.</p>'}
-      <button class="ai-btn" data-ai="${id}">${llm.ok || !llm.checked ? '✨ AI 설명 듣기' : '📝 규칙 기반 설명 보기'}</button>`;
-  } else if (s.status === 'loading') {
-    body = `<div class="ai-text loading" aria-live="polite">${s.text ? aiText(s.text) : '<p class="hint">AI가 설명을 준비하고 있어요… 내 컴퓨터에서 돌아가서 30초 정도 걸릴 수 있어요.</p>'}<span class="caret" aria-hidden="true"></span></div>
-      <button class="ai-btn ghost-sm" data-ai-stop>그만 만들기</button>`;
-  } else {
-    body = `<div class="ai-text">${aiText(s.text)}</div>
-      ${s.note ? `<p class="hint warn">${esc(s.note)}</p>` : ''}
-      <div class="ai-foot"><small>${s.source === 'llm' ? `${esc(llm.model)} · ${Math.round((s.ms ?? 0) / 1000)}초` : ''} · 점수·답변 같은 사실은 추천 알고리즘이 계산했어요</small>
-      <button class="link-btn" data-ai="${id}">다시 만들기</button></div>`;
+const isMatched = (id) => findRequest(me.requests, id)?.status === 'accepted';
+const aiPickOf = (id) => me.ai?.picks?.find((p) => p.id === id);
+const sigOf = (s) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7).toString(36);
+const secs = (ms) => `${Math.max(1, Math.round((ms ?? 0) / 1000))}초`;
+
+// AI 매칭 입력: 후보와 "내 특징 + 후보 명단" 서명 (프로필이 바뀌면 다시 매칭하라고 알려 주려고)
+function aiInput() {
+  const cands = aiCandidates(me, pool);
+  return { cands, sig: sigOf(JSON.stringify([myTraits(me), cands.map((c) => c.profile.id)])) };
+}
+
+// 예선·결선을 합쳐 LLM에 몇 번 물어보는지
+function stepsFor(n) {
+  let steps = 0;
+  while (n > BATCH_SIZE) {
+    const groups = Math.ceil(n / BATCH_SIZE);
+    steps += groups;
+    n = groups * 2;
   }
-  return `<section class="ai-box ${s?.status ?? ''}" data-ai-box="${id}">${head}${body}</section>`;
+  return steps + 1;
+}
+
+// 서버의 한 줄 JSON 스트림 읽기
+async function streamApi(path, body, signal, onMsg) {
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? `서버 응답 ${r.status}`);
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const msg = JSON.parse(buf.slice(0, i));
+      buf = buf.slice(i + 1);
+      if (msg.error) throw new Error(msg.error);
+      onMsg(msg);
+    }
+  }
+}
+
+// 후보 한 조(최대 8명)를 LLM에 보여 주고 pick명을 고르게 함
+async function askPick(group, pick, step) {
+  Object.assign(aiJob, { step, phase: 'read', size: group.length, stepStart: Date.now() });
+  updateAim();
+  let picks = null;
+  const body = {
+    me: myTraits(me),
+    meName: callName(me.name),
+    candidates: group.map((c) => ({ text: traitsOf(c.profile, { distance: c.distance, me }) })),
+    pick,
+  };
+  await streamApi('api/ai-match', body, aiJob.abort.signal, (msg) => {
+    if (msg.phase) {
+      aiJob.phase = msg.phase;
+      updateAim();
+    }
+    if (msg.done) picks = msg.picks;
+  });
+  if (!picks?.length) throw new Error('AI 답이 비어 있어요');
+  // 서버는 후보를 보낸 순서대로 A, B, C… 로 부름
+  return picks.map((p) => ({ cand: group[LABELS.indexOf(p.id)], reason: p.reason })).filter((p) => p.cand);
+}
+
+async function runAiMatch() {
+  if (aiJob) return showToast('AI가 다른 일을 하는 중이에요. 끝나면 다시 눌러 주세요');
+  const { cands, sig } = aiInput();
+  if (!cands.length) return showToast('서로 조건이 맞는 상대가 없어요. 원하는 조건을 넓혀 보세요');
+  const base = { at: Date.now(), sig, total: cands.length };
+
+  if (!llm.ok) {
+    me.ai = { ...base, picks: fallbackPicks(me, cands), source: 'rule' };
+    save();
+    return render();
+  }
+
+  const abort = new AbortController();
+  aiJob = { kind: 'match', abort, phase: 'read', step: 1, steps: stepsFor(cands.length), size: cands.length, startedAt: Date.now() };
+  render();
+  try {
+    let list = cands;
+    let step = 0;
+    // 후보가 많으면 예선: 조마다 2명씩 올려 결선 진출자를 뽑음
+    while (list.length > BATCH_SIZE) {
+      const next = [];
+      for (const group of splitGroups(list)) next.push(...(await askPick(group, 2, ++step)).map((p) => p.cand));
+      list = next;
+    }
+    const final = await askPick(list, Math.min(PICK_COUNT, list.length), ++step);
+    me.ai = { ...base, picks: final.map((p) => ({ id: p.cand.profile.id, reason: p.reason })), source: 'llm', model: llm.model, ms: Date.now() - aiJob.startedAt, rounds: step };
+    showToast('🤖 AI가 매칭 상대를 골랐어요');
+  } catch (e) {
+    if (!abort.signal.aborted) me.ai = { ...base, picks: fallbackPicks(me, cands), source: 'rule', note: `${e.message} 그래서 규칙으로 대신 골랐어요.` };
+  } finally {
+    aiJob = null;
+    save();
+    render();
+  }
+}
+
+// 진행 상황 · 시작 버튼 상자
+function aimBox() {
+  const { cands, sig } = aiInput();
+  let body;
+  if (aiJob?.kind === 'match') {
+    const j = aiJob;
+    const stage = j.steps > 1 ? (j.step < j.steps ? `예선 ${j.step}/${j.steps - 1}조` : '결선') : '';
+    const what = j.phase === 'read' ? `후보 ${j.size}명의 특징을 읽고 비교하는 중…` : '고른 상대와 이유를 쓰는 중…';
+    body = `
+      <p class="aim-now">🤖 ${stage ? `<b>${stage}</b> · ` : ''}${what}</p>
+      <div class="aim-progress" aria-hidden="true"><div></div></div>
+      <p class="hint">${secs(Date.now() - j.startedAt)} 지남 · 내 컴퓨터 CPU에서 돌아가서 1~3분 걸릴 수 있어요</p>
+      <button class="ai-btn ghost-sm" data-ai-stop>그만하기</button>`;
+  } else if (!cands.length) {
+    body = `<p>서로 반드시 조건이 맞는 상대가 없어서 AI에게 보여 줄 후보가 없어요.</p>
+      <button class="ai-btn" data-open="prefs">원하는 조건 넓히기</button>`;
+  } else {
+    const stale = me.ai && me.ai.sig !== sig;
+    body = `
+      ${!llm.ok && llm.checked ? `<p class="hint warn">${esc(llm.error)}</p>` : ''}
+      ${stale ? '<p class="hint warn">프로필이나 조건이 바뀌었어요. 다시 매칭하면 바뀐 내용으로 골라요.</p>' : ''}
+      <button class="ai-btn" data-ai-match>${llm.ok || !llm.checked ? (me.ai ? '🤖 AI 매칭 다시 하기' : '🤖 AI 매칭 시작') : '📝 규칙으로 대신 고르기'}</button>`;
+  }
+  return `<section class="ai-box aim-box" data-aim-box>
+    <div class="ai-head"><b>🤖 LLM 매칭</b><small>${llmLabel()}</small></div>${body}</section>`;
+}
+
+const updateAim = () => {
+  const el = document.querySelector('[data-aim-box]');
+  if (el) el.outerHTML = aimBox();
+};
+
+// LLM에게 보내는 특징 목록 (리스트업)
+function traitsSection(cands) {
+  if (!cands.length) return '';
+  const shown = cands.length <= BATCH_SIZE;
+  return `
+    <details class="more aim-traits">
+      <summary>📋 LLM에게 보내는 특징 목록 보기 (나 + 후보 ${cands.length}명)</summary>
+      <p class="hint">이 글이 그대로 LLM에 들어가요. 후보 순서는 추천 점수와 상관없이 섞었어요.${shown ? '' : ` 후보가 많아서 ${BATCH_SIZE}명씩 나눠 보여 줘요.`}</p>
+      <h3>나</h3><pre class="traits">${esc(myTraits(me))}</pre>
+      <h3>후보</h3>
+      ${cands.map((c, i) => `<pre class="traits">${esc(traitsOf(c.profile, { label: shown ? LABELS[i] : '', distance: c.distance, me }))}</pre>`).join('')}
+    </details>`;
+}
+
+// AI가 고른 상대 카드
+function pickCard(pick, i) {
+  const p = profileById.get(pick.id);
+  if (!p || p.gender === me.gender) return '';
+  const m = matchPair(me, p);
+  const medal = ['🥇', '🥈', '🥉'][i] ?? `${i + 1}위`;
+  return `
+    <article class="card aim-pick">
+      <header class="match-head">
+        ${avatarEl(p)}
+        <div class="match-who">
+          <h2><span class="aim-medal">${medal}</span> ${esc(p.name)} <span>${p.age}</span></h2>
+          <p>${esc(p.job)} · ${p.region} · ${Math.round(m.distance)}km</p>
+        </div>
+      </header>
+      <p class="aim-reason"><b>${me.ai.source === 'rule' ? '📝 규칙으로 고른 이유' : '🤖 AI가 고른 이유'}</b>${esc(pick.reason)}</p>
+      <div class="chips static">${p.interests.map((t) => `<span class="tag ${me.interests.includes(t) ? 'accent' : ''}">${t}</span>`).join('')}</div>
+      ${isMatched(p.id) ? explainBlock(p.id) : '<p class="hint aim-next">💌 매칭을 신청해서 성사되면, AI가 두 사람이 왜 잘 맞는지 자세히 설명해 드려요.</p>'}
+      <div class="card-actions">${chatAction(p)}${requestAction(p)}</div>
+    </article>`;
+}
+
+function pickList() {
+  const a = me.ai;
+  return `
+    <section class="group">
+      <h2 class="group-title">${a.source === 'rule' ? '📝 규칙으로 고른 상대' : '🤖 AI가 고른 상대'}</h2>
+      <p class="group-desc">${a.source === 'llm' ? `${esc(a.model)}가 후보 ${a.total}명의 특징을 읽고 골랐어요 · ${secs(a.ms)}` : `LLM 없이 추천 점수 순으로 골랐어요 · 후보 ${a.total}명`}</p>
+      ${a.note ? `<p class="hint warn aim-note">${esc(a.note)}</p>` : ''}
+      ${a.picks.map(pickCard).join('')}
+    </section>`;
+}
+
+// AI가 고르지 않았어도, 신청이 승인된 상대는 모두 설명을 들을 수 있음
+function matchedSection() {
+  const ids = [...new Set([...me.requests.sent, ...me.requests.received].filter((r) => r.status === 'accepted').map((r) => r.id))].filter(
+    (id) => !aiPickOf(id) && profileById.has(id),
+  );
+  if (!ids.length) return '';
+  return `
+    <section class="group">
+      <h2 class="group-title">💞 성사된 매칭</h2>
+      <p class="group-desc">서로 승인한 상대예요. AI에게 왜 매칭됐는지 물어보세요.</p>
+      ${ids
+        .map((id) => {
+          const p = profileById.get(id);
+          return `<article class="card aim-pick">
+            <header class="match-head">${avatarEl(p)}<div class="match-who"><h2>${esc(p.name)} <span>${p.age}</span></h2><p>${esc(p.job)} · ${p.region}</p></div></header>
+            ${explainBlock(id)}
+            <div class="card-actions">${chatAction(p)}${requestAction(p)}</div>
+          </article>`;
+        })
+        .join('')}
+    </section>`;
+}
+
+function renderAi() {
+  if (!me.onboarded) {
+    return `<section class="empty"><div class="flow-emoji" aria-hidden="true">🤖</div><p>가입을 마치면 AI가 매칭 상대를 골라 드려요</p>
+      <p class="hint">프로필, 자기소개, 가치관을 LLM이 읽고 판단해요.</p><button class="cta" data-ob-start>1분 만에 시작하기</button></section>`;
+  }
+  const { cands } = aiInput();
+  const opposite = pool.filter((p) => p.gender !== me.gender).length;
+  return `
+    <section class="hero aim-hero">
+      <p>점수 계산 없이, LLM이 직접 판단해요</p>
+      <h2>특징을 읽고 고르는<br><em>AI 매칭</em></h2>
+      <ol class="aim-steps">
+        <li><b>1</b><span>이성 ${opposite}명 중 서로의 <u>반드시 조건</u>을 통과한 <strong>${cands.length}명</strong>이 후보</span></li>
+        <li><b>2</b><span>나와 후보의 특징(자기소개·관심사·가치관·바라는 점)을 글로 리스트업</span></li>
+        <li><b>3</b><span>로컬 LLM이 읽고 가장 잘 맞는 <strong>${Math.min(PICK_COUNT, cands.length)}명</strong>을 골라 이유를 써요${cands.length > BATCH_SIZE ? ` (${BATCH_SIZE}명씩 예선 → 결선)` : ''}</span></li>
+        <li><b>4</b><span>매칭이 성사되면 두 사람이 왜 매칭됐는지 설명해요</span></li>
+      </ol>
+    </section>
+    ${aimBox()}
+    ${traitsSection(cands)}
+    ${me.ai ? pickList() : ''}
+    ${matchedSection()}`;
+}
+
+// ---------- 매칭 성사 후 AI 설명 ----------
+function explainBlock(id) {
+  const saved = me.aiExplain?.[id];
+  const live = explaining.get(id);
+  const p = profileById.get(id);
+  const source = live || !saved ? llmLabel() : saved.source === 'llm' ? `로컬 LLM · ${esc(saved.model ?? '')}` : 'LLM 대신 규칙으로 만든 설명';
+  const head = `<div class="ai-head"><b>💞 왜 매칭됐을까?</b><small>${source}</small></div>`;
+  let body;
+  if (live) {
+    body = `<div class="ai-text loading" aria-live="polite">${live.text ? aiText(live.text) : '<p class="hint">AI가 두 사람의 특징을 읽고 있어요… 내 컴퓨터에서 돌아가서 1분 정도 걸릴 수 있어요.</p>'}<span class="caret" aria-hidden="true"></span></div>
+      <button class="ai-btn ghost-sm" data-ai-stop>그만 만들기</button>`;
+  } else if (saved) {
+    body = `<div class="ai-text">${aiText(saved.text)}</div>
+      ${saved.note ? `<p class="hint warn">${esc(saved.note)}</p>` : ''}
+      <div class="ai-foot"><small>${saved.source === 'llm' ? `${esc(saved.model ?? '')} · ${secs(saved.ms)} · ` : ''}두 사람의 프로필에 적힌 내용만 썼어요</small>
+      <button class="link-btn" data-explain="${id}">다시 만들기</button></div>`;
+  } else {
+    body = `<p class="hint">${esc(p?.name ?? '')}님과 매칭이 성사됐어요! AI가 두 사람의 특징을 읽고 왜 잘 맞는지 설명해 드려요.</p>
+      <button class="ai-btn" data-explain="${id}">${llm.ok || !llm.checked ? '✨ 매칭 이유 AI 설명 듣기' : '📝 규칙 기반 설명 보기'}</button>`;
+  }
+  return `<section class="ai-box ${live ? 'loading' : ''}" data-ai-box="${id}">${head}${body}</section>`;
 }
 
 // 화면 전체를 다시 그리지 않고 설명 상자만 갱신 (사진 넘기던 위치 등이 유지되도록)
 function updateAi(id) {
-  const box = document.querySelector(`[data-ai-box="${CSS.escape(id)}"]`);
-  if (box) box.outerHTML = aiBlock(id);
+  document.querySelectorAll(`[data-ai-box="${CSS.escape(id)}"]`).forEach((box) => (box.outerHTML = explainBlock(id)));
 }
 
-async function runAi(id) {
-  if (aiRun && aiRun.id !== id) return showToast('다른 상대의 설명을 만드는 중이에요. 끝나면 다시 눌러 주세요');
-  const list = matches().matches;
-  const rank = list.findIndex((m) => m.profile.id === id);
-  if (rank < 0) return;
-  const facts = buildMatchFacts(me, list[rank], { rank, headline: rank === 0 ? explainTop(me, list)?.headline : '' });
-
+async function runExplain(id) {
+  if (aiJob) return showToast(aiJob.kind === 'match' ? 'AI가 매칭 상대를 고르는 중이에요. 끝나면 다시 눌러 주세요' : '다른 설명을 만드는 중이에요. 끝나면 다시 눌러 주세요');
+  const p = profileById.get(id);
+  if (!p) return;
+  const reason = aiPickOf(id)?.reason ?? '';
+  const rule = (note) => ({ text: fallbackMatchExplanation(me, p, reason), source: 'rule', note, at: Date.now() });
   if (!llm.ok) {
-    ai.set(id, { status: 'done', text: fallbackExplanation(facts), source: 'rule' });
+    me.aiExplain[id] = rule();
+    save();
     return updateAi(id);
   }
 
   const abort = new AbortController();
-  aiRun = { id, abort };
-  const state = { status: 'loading', text: '', source: 'llm' };
-  ai.set(id, state);
+  aiJob = { kind: 'explain', id, abort, startedAt: Date.now() };
+  const live = { text: '' };
+  explaining.set(id, live);
   updateAi(id);
   let pending = null; // 글자가 올 때마다 그리면 무거워서 화면 갱신은 한 박자에 한 번
   const paint = () => (pending ??= setTimeout(() => ((pending = null), updateAi(id)), 80));
+  let ms = null;
   try {
-    const r = await fetch('api/explain', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ facts }),
-      signal: abort.signal,
-    });
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? `서버 응답 ${r.status}`);
-    const decoder = new TextDecoder();
-    let buf = '';
-    for await (const chunk of r.body) {
-      buf += decoder.decode(chunk, { stream: true });
-      let i;
-      while ((i = buf.indexOf('\n')) >= 0) {
-        const msg = JSON.parse(buf.slice(0, i));
-        buf = buf.slice(i + 1);
-        if (msg.error) throw new Error(msg.error);
-        if (msg.t) {
-          state.text += msg.t;
-          paint();
-        }
-        if (msg.done) state.ms = msg.ms;
+    const facts = explainFacts(me, p, { distance: matchPair(me, p).distance, reason });
+    await streamApi('api/match-explain', facts, abort.signal, (msg) => {
+      if (msg.t) {
+        live.text += msg.t;
+        paint();
       }
-    }
-    if (!state.text.trim()) throw new Error('AI가 빈 답을 보냈어요');
-    state.status = 'done';
+      if (msg.done) ms = msg.ms;
+    });
+    if (!live.text.trim()) throw new Error('AI가 빈 답을 보냈어요.');
+    me.aiExplain[id] = { text: live.text.trim(), source: 'llm', model: llm.model, ms, at: Date.now() };
   } catch (e) {
-    if (abort.signal.aborted) {
-      if (state.text.trim()) Object.assign(state, { status: 'done', note: '설명을 중간에 멈췄어요.' });
-      else ai.delete(id);
-    } else {
-      // LLM이 실패하면 같은 형식의 규칙 기반 설명으로 대신함
-      Object.assign(state, { status: 'done', source: 'rule', text: fallbackExplanation(facts), note: `${e.message} 대신 규칙으로 만든 설명을 보여드려요.` });
-    }
+    if (!abort.signal.aborted) me.aiExplain[id] = rule(`${e.message} 대신 규칙으로 만든 설명을 보여드려요.`);
+    else if (live.text.trim()) me.aiExplain[id] = { text: live.text.trim(), source: 'llm', model: llm.model, ms: Date.now() - aiJob.startedAt, note: '설명을 중간에 멈췄어요.', at: Date.now() };
   } finally {
     clearTimeout(pending);
-    aiRun = null;
+    explaining.delete(id);
+    aiJob = null;
+    save();
     updateAi(id);
   }
 }
+
+// 자기소개 입력칸 (가입 단계와 내 프로필에서 같이 씀)
+const selfIntroInput = () =>
+  `<textarea class="intro-input" data-path="selfIntro" maxlength="150" rows="4" placeholder="예: 주말엔 카페에서 책 읽는 걸 좋아해요. 대화가 잘 통하는 사람을 만나고 싶어요." aria-label="자기소개">${esc(me.selfIntro ?? '')}</textarea>
+   <p class="hint">150자까지 · 나를 잘 보여 주는 취미, 성격, 바라는 연애를 적어 보세요</p>`;
 
 // 확인 창의 "신청하기/승인하기"
 function confirmSheet() {
@@ -1322,8 +1552,9 @@ document.addEventListener('click', (e) => {
     return render();
   }
   if (hit('[data-sheet-confirm]')) return confirmSheet();
-  if ((el = hit('[data-ai]'))) return runAi(el.dataset.ai);
-  if (hit('[data-ai-stop]')) return aiRun?.abort.abort();
+  if (hit('[data-ai-match]')) return runAiMatch();
+  if ((el = hit('[data-explain]'))) return runExplain(el.dataset.explain);
+  if (hit('[data-ai-stop]')) return aiJob?.abort.abort();
   if ((el = hit('[data-c-move]'))) {
     const slides = el.closest('[data-carousel]').querySelector('.slides');
     slides.scrollBy({ left: Number(el.dataset.cMove) * slides.clientWidth, behavior: 'smooth' });
@@ -1539,8 +1770,9 @@ setInterval(() => {
   }
   for (const r of decided) {
     const p = profileById.get(r.id);
-    showToast(r.status === 'accepted' ? `🎉 ${p.name}님이 매칭을 승인했어요!` : `${p.name}님이 이번 매칭은 어렵다고 했어요`);
+    showToast(r.status === 'accepted' ? `🎉 ${p.name}님이 매칭을 승인했어요! AI 매칭 탭에서 매칭 이유를 들어 보세요` : `${p.name}님이 이번 매칭은 어렵다고 했어요`);
   }
+  if (aiJob?.kind === 'match') updateAim();
   // 채팅방 안에서는 입력 중인 글이 지워지지 않게 메시지 목록만 갱신
   if (room !== null) {
     if (arrived.some((a) => a.room.id === room) || (ticks % 30 === 0)) refreshChatLog();

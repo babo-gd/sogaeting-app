@@ -676,3 +676,38 @@ body.sheet-open { overflow: hidden; }
   :root:not([data-theme='light']) .ai-box { background: linear-gradient(160deg, #231d38, #2a1f15); border-color: #3a3150; }
 }
 :root[data-theme='dark'] .ai-box { background: linear-gradient(160deg, #231d38, #2a1f15); border-color: #3a3150; }
+
+/* ---------- AI 매칭 탭 (LLM이 직접 고르는 매칭) ---------- */
+.hero.aim-hero { background: linear-gradient(150deg, #8a6cf0 0%, #5b3fd6 100%); }
+.aim-steps { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 8px; }
+.aim-steps li { display: grid; grid-template-columns: 24px 1fr; gap: 10px; align-items: start; font-size: 14px; line-height: 1.45; }
+.aim-steps li > b { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: rgba(255, 255, 255, 0.22); font-size: 13px; }
+.aim-steps u { text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.aim-box { margin-top: 14px; }
+.aim-box > p:not(.hint) { margin: 10px 0 0; font-size: 14.5px; line-height: 1.5; }
+.aim-now b { color: #6b4ce6; }
+.aim-progress { position: relative; height: 6px; margin-top: 12px; border-radius: 3px; background: var(--track); overflow: hidden; }
+.aim-progress div { position: absolute; inset: 0 auto 0 0; width: 35%; border-radius: 3px; background: #6b4ce6; animation: aim-slide 1.4s ease-in-out infinite; }
+@keyframes aim-slide { from { left: -35%; } to { left: 100%; } }
+.aim-traits { margin-top: 14px; padding: 4px 16px 14px; border-top: 0; border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+.aim-traits h3 { margin: 14px 0 6px; font-size: 13px; color: var(--text-3); }
+.traits { margin: 0 0 8px; padding: 10px 12px; border-radius: 12px; background: var(--surface-2); font: inherit; font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; }
+.card.aim-pick { margin-top: 12px; padding: 16px 18px 18px; }
+.aim-pick .match-head { grid-template-columns: auto 1fr; }
+.aim-medal { font-size: 20px; vertical-align: -2px; }
+.aim-reason { margin: 14px 0 12px; padding: 12px 14px; border-radius: 14px; background: #f4f1ff; font-size: 14.5px; line-height: 1.55; }
+.aim-reason b { display: block; margin-bottom: 2px; font-size: 12px; color: #6b4ce6; }
+.aim-next { margin-top: 12px; }
+.aim-note { margin: 0 4px 8px; }
+.banner.ai { background: linear-gradient(120deg, #8a6cf0, #5b3fd6); color: #fff; }
+.best.ai { color: #6b4ce6; margin-top: 4px; }
+.intro-input { display: block; width: 100%; min-height: 104px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface-2); color: inherit; font: inherit; font-size: 16px; line-height: 1.5; resize: vertical; }
+.intro-input:focus { outline: none; border-color: var(--accent); background: var(--surface); }
+.group .card > .intro-input { margin-top: 16px; }
+.group .card > .intro-input + .hint { padding-bottom: 16px; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .aim-reason { background: #231d38; }
+  :root:not([data-theme='light']) .aim-now b, :root:not([data-theme='light']) .aim-reason b, :root:not([data-theme='light']) .best.ai { color: #b7a3ff; }
+}
+:root[data-theme='dark'] .aim-reason { background: #231d38; }
+:root[data-theme='dark'] .aim-now b, :root[data-theme='dark'] .aim-reason b, :root[data-theme='dark'] .best.ai { color: #b7a3ff; }
